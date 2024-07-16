@@ -1,9 +1,11 @@
 import { HoppCollection, HoppRESTRequest } from "@hoppscotch/data";
 import chalk from "chalk";
-import { log } from "console";
+import { info, log } from "console";
 import * as A from "fp-ts/Array";
 import { pipe } from "fp-ts/function";
+import fs from "fs";
 import { round } from "lodash-es";
+import path from "path";
 
 import { CollectionRunnerParam } from "../types/collections";
 import {
@@ -34,7 +36,95 @@ import {
 } from "./request";
 import { getTestMetrics } from "./test";
 
-const { WARN, FAIL } = exceptionColors;
+import { create } from "xmlbuilder2";
+import { XMLBuilder } from "xmlbuilder2/lib/interfaces";
+import { error } from "../types/errors";
+
+const { WARN, FAIL, INFO, SUCCESS } = exceptionColors;
+
+// Create the root XML element
+const root = create({ version: "1.0", encoding: "UTF-8" }).ele("testsuites");
+
+const buildJUnitReport = ({
+  path,
+  tests: testSuites,
+  errors: requestTestSuiteErrors,
+  duration,
+}: Omit<RequestReport, "result">) => {
+  let requestTestSuiteError: XMLBuilder | null = null;
+
+  // Create a suite at the request level
+  const requestTestSuite = root.ele("testsuite", {
+    name: path,
+    time: duration.test,
+    timestamp: new Date().toISOString(),
+  });
+
+  if (requestTestSuiteErrors.length > 0) {
+    requestTestSuiteError = requestTestSuite.ele("system-err");
+  }
+
+  let systemErrContent = "";
+
+  requestTestSuiteErrors.forEach((error) => {
+    let compiledError = error.code;
+
+    if ("data" in error) {
+      compiledError += ` - ${error.data}`;
+    }
+
+    // Append each error message with a newline for separation
+    systemErrContent += `${compiledError}\n`;
+  });
+
+  if (requestTestSuiteError) {
+    requestTestSuiteError.dat(systemErrContent);
+  }
+
+  let requestTestCases = 0;
+  let erroredRequestTestCases = 0;
+  let failedRequestTestCases = 0;
+
+  testSuites.forEach(({ descriptor, expectResults }) => {
+    requestTestCases += expectResults.length;
+
+    const failedTestCases = expectResults.filter(
+      ({ status }) => status === "fail"
+    ).length;
+
+    failedRequestTestCases += failedTestCases;
+
+    const erroredTestCases = expectResults.filter(
+      ({ status }) => status === "error"
+    ).length;
+
+    erroredRequestTestCases += erroredTestCases;
+
+    expectResults.forEach(({ status, message }) => {
+      const testCase = requestTestSuite.ele("testcase", {
+        name: `${descriptor} - ${message}`,
+      });
+
+      if (status === "fail") {
+        testCase
+          .ele("failure")
+          .att("type", "AssertionFailure")
+          .att("message", message);
+      } else if (status === "error") {
+        testCase.ele("error").att("message", message);
+      }
+    });
+  });
+
+  requestTestSuite.att("tests", requestTestCases.toString());
+  requestTestSuite.att("failures", failedRequestTestCases.toString());
+  requestTestSuite.att("errors", erroredRequestTestCases.toString());
+
+  return {
+    failedRequestTestCases,
+    erroredRequestTestCases,
+  };
+};
 
 /**
  * Processes each requests within collections to prints details of subsequent requests,
@@ -56,19 +146,22 @@ export const collectionsRunner = async (
     // Pop out top-most collection from stack to be processed.
     const { collection, path } = <CollectionStack>collectionStack.pop();
 
-      // Processing each request in collection
-      for (const request of collection.requests) {
-        const _request = preProcessRequest(request as HoppRESTRequest, collection);
-        const requestPath = `${path}/${_request.name}`;
-        const processRequestParams: ProcessRequestParams = {
-          path: requestPath,
-          request: _request,
-          envs,
-          delay,
-        };
+    // Processing each request in collection
+    for (const request of collection.requests) {
+      const _request = preProcessRequest(
+        request as HoppRESTRequest,
+        collection
+      );
+      const requestPath = `${path}/${_request.name}`;
+      const processRequestParams: ProcessRequestParams = {
+        path: requestPath,
+        request: _request,
+        envs,
+        delay,
+      };
 
-        // Request processing initiated message.
-        log(WARN(`\nRunning: ${chalk.bold(requestPath)}`));
+      // Request processing initiated message.
+      log(WARN(`\nRunning: ${chalk.bold(requestPath)}`));
 
       // Processing current request.
       const result = await processRequest(processRequestParams)();
@@ -78,34 +171,39 @@ export const collectionsRunner = async (
       envs.global = global;
       envs.selected = selected;
 
-        // Storing current request's report.
-        const requestReport = result.report;
-        requestsReport.push(requestReport);
-      }
-
-      // Pushing remaining folders realted collection to stack.
-      for (const folder of collection.folders) {
-        const updatedFolder: HoppCollection = { ...folder }
-
-        if (updatedFolder.auth?.authType === "inherit") {
-          updatedFolder.auth = collection.auth;
-        }
-
-        if (collection.headers?.length) {
-          // Filter out header entries present in the parent collection under the same name
-          // This ensures the folder headers take precedence over the collection headers
-          const filteredHeaders = collection.headers.filter((collectionHeaderEntries) => {
-            return !updatedFolder.headers.some((folderHeaderEntries) => folderHeaderEntries.key === collectionHeaderEntries.key)
-          })
-          updatedFolder.headers.push(...filteredHeaders);
-        }
-
-        collectionStack.push({
-          path: `${path}/${updatedFolder.name}`,
-          collection: updatedFolder,
-        });
-      }
+      // Storing current request's report.
+      const requestReport = result.report;
+      requestsReport.push(requestReport);
     }
+
+    // Pushing remaining folders realted collection to stack.
+    for (const folder of collection.folders) {
+      const updatedFolder: HoppCollection = { ...folder };
+
+      if (updatedFolder.auth?.authType === "inherit") {
+        updatedFolder.auth = collection.auth;
+      }
+
+      if (collection.headers?.length) {
+        // Filter out header entries present in the parent collection under the same name
+        // This ensures the folder headers take precedence over the collection headers
+        const filteredHeaders = collection.headers.filter(
+          (collectionHeaderEntries) => {
+            return !updatedFolder.headers.some(
+              (folderHeaderEntries) =>
+                folderHeaderEntries.key === collectionHeaderEntries.key
+            );
+          }
+        );
+        updatedFolder.headers.push(...filteredHeaders);
+      }
+
+      collectionStack.push({
+        path: `${path}/${updatedFolder.name}`,
+        collection: updatedFolder,
+      });
+    }
+  }
 
   return requestsReport;
 };
@@ -134,7 +232,8 @@ const getCollectionStack = (collections: HoppCollection[]): CollectionStack[] =>
  * False, if errors occurred or test-cases failed.
  */
 export const collectionsRunnerResult = (
-  requestsReport: RequestReport[]
+  requestsReport: RequestReport[],
+  reporterJUnitExportPath?: string
 ): boolean => {
   const overallTestMetrics = <TestMetrics>{
     tests: { failed: 0, passed: 0 },
@@ -152,6 +251,9 @@ export const collectionsRunnerResult = (
   };
   let finalResult = true;
 
+  let totalerroredTestCases = 0;
+  let totalFailedTestCases = 0;
+
   // Printing requests-report details of failed-tests and errors
   for (const requestReport of requestsReport) {
     const { path, tests, errors, result, duration } = requestReport;
@@ -164,6 +266,19 @@ export const collectionsRunnerResult = (
     printFailedTestsReport(path, tests);
 
     printErrorsReport(path, errors);
+
+    if (reporterJUnitExportPath) {
+      const { failedRequestTestCases, erroredRequestTestCases } =
+        buildJUnitReport({
+          path,
+          tests,
+          errors,
+          duration,
+        });
+
+      totalFailedTestCases += failedRequestTestCases;
+      totalerroredTestCases += erroredRequestTestCases;
+    }
 
     /**
      * Extracting current request report's test-metrics and updating
@@ -215,6 +330,52 @@ export const collectionsRunnerResult = (
   printTestsMetrics(overallTestMetrics);
   printRequestsMetrics(overallRequestMetrics);
   printPreRequestMetrics(overallPreRequestMetrics);
+
+  if (reporterJUnitExportPath) {
+    const totalTestCases =
+      overallTestMetrics.tests.failed + overallTestMetrics.tests.passed;
+
+    root
+      .att("tests", totalTestCases.toString())
+      .att("failures", totalFailedTestCases.toString())
+      .att("errors", totalerroredTestCases.toString())
+      .att("time", overallTestMetrics.duration.toString());
+
+    // Convert the XML structure to a string
+    const xmlString = root.end({ prettyPrint: true });
+
+    // Write the XML string to a file
+    try {
+      const resolvedExportPath = path.resolve(reporterJUnitExportPath);
+
+      if (fs.existsSync(resolvedExportPath)) {
+        info(
+          INFO(
+            `\nOverwriting the pre-existing path: ${reporterJUnitExportPath}.`
+          )
+        );
+      }
+
+      fs.mkdirSync(path.dirname(resolvedExportPath), {
+        recursive: true,
+      });
+
+      fs.writeFileSync(resolvedExportPath, xmlString);
+
+      log(
+        SUCCESS(
+          `\nSuccessfully exported the JUnit report to: ${reporterJUnitExportPath}.`
+        )
+      );
+    } catch (err) {
+      const data = err instanceof Error ? err.message : null;
+      throw error({
+        code: "REPORT_EXPORT_FAILED",
+        data,
+        path: reporterJUnitExportPath,
+      });
+    }
+  }
 
   return finalResult;
 };
