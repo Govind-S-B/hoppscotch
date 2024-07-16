@@ -52,6 +52,7 @@ import { useI18n } from "@composables/i18n"
 import { useToast } from "@composables/toast"
 import { useVModel } from "@vueuse/core"
 import axios from "axios"
+import { HoppRESTRequest } from "@hoppscotch/data"
 
 const toast = useToast()
 const t = useI18n()
@@ -61,6 +62,7 @@ const props = withDefaults(
     show: boolean
     loadingState: boolean
     modelValue?: string
+    requestContext: HoppRESTRequest | null
   }>(),
   {
     show: false,
@@ -100,14 +102,12 @@ const autoRename = async () => {
   isAutoRenaming.value = true
 
   const testCase = {
-    method: "GET",
-    api_url: "https://api.example.com/users/12345",
-    params: {},
-    body: null,
-    headers: {
-      Accept: "application/json",
-    },
-    authorization: "Bearer your_access_token",
+    method: props.requestContext?.method || "",
+    api_url: props.requestContext?.endpoint || "",
+    params: props.requestContext?.params || {},
+    body: props.requestContext?.body || null,
+    headers: props.requestContext?.headers || {},
+    authorization: props.requestContext?.auth || "",
   }
 
   try {
